@@ -117,12 +117,27 @@ button:disabled { opacity: .45; cursor: default; }
 // L'API, elle, annonce max-age=60 et autorise le CORS.
 //
 // raw reste en REPLI : l'API plafonne a 60 requetes par heure et par IP sans
-// authentification. Cette page en consomme 6 (un passage toutes les dix
-// minutes), mais un visiteur qui martele "Check now" peut epuiser le quota --
-// et une adresse un peu vieille vaut mieux que pas d'adresse du tout.
+// authentification. La cadence adaptative plus bas est dimensionnee pour
+// rester loin de ce plafond, mais un visiteur qui martele "Check now" peut
+// l'epuiser -- et une adresse un peu vieille vaut mieux que pas d'adresse.
 const SOURCE_API = "https://api.github.com/repos/cheapmanga/SteamTrack/contents/tunnel.json?ref=main";
 const SOURCE_RAW = "https://raw.githubusercontent.com/cheapmanga/SteamTrack/main/tunnel.json";
-const EVERY_MS = 600000;          // 10 minutes
+// Cadence adaptative.
+//
+// En marche normale, dix minutes suffisent : l'adresse ne change qu'au
+// redemarrage de la VM. Mais c'est precisement apres un redemarrage qu'on
+// vient ici, et attendre dix minutes pour voir le service revenir serait
+// absurde. Des qu'il ne repond plus, on repasse donc a dix secondes.
+//
+// Le doublement a chaque echec n'est pas une coquetterie : l'API GitHub
+// plafonne a 60 requetes par heure et par IP sans authentification. A dix
+// secondes fixes, une panne prolongee epuiserait le quota en un quart
+// d'heure, et la page basculerait sur raw -- donc sur des adresses perimees,
+// exactement ce qu'on cherche a fuir. Avec le doublement, cinq minutes de
+// panne coutent cinq requetes.
+const OK_MS = 600000;             // 10 min quand le service repond
+const MIN_MS = 10000;             // premier reessai apres un echec
+const MAX_MS = 600000;            // plafond du doublement
 
 const dot = document.getElementById("dot");
 const msg = document.getElementById("msg");
@@ -138,11 +153,14 @@ function setState(kind, text) {
     msg.textContent = text;
 }
 
-// bust : contourner les caches autant que possible. Cote API cela fonctionne
-// vraiment ; cote raw c'est sans effet, d'ou l'ordre des sources ci-dessus.
-async function readSource(bust) {
+// L'horodatage est SYSTEMATIQUE, pas reserve a une relecture de secours :
+// mesure du 19/07/2026, une valeur fraichement publiee apparait en 2,6 s avec,
+// contre 12,8 s sans. Le cache de l'API est indexe sur l'URL complete, donc un
+// parametre unique le contourne. Cote raw le meme parametre n'aurait aucun
+// effet -- son cache CDN ne regarde que le chemin.
+async function readSource() {
     try {
-        const resp = await fetch(SOURCE_API + (bust ? "&t=" + Date.now() : ""),
+        const resp = await fetch(SOURCE_API + "&t=" + Date.now(),
                                  { cache: "no-store",
                                    headers: { Accept: "application/vnd.github+json" } });
         if (!resp.ok) throw new Error("HTTP " + resp.status);
@@ -153,8 +171,7 @@ async function readSource(bust) {
     } catch (err) {
         // Quota epuise, panne de l'API, reponse illisible : on se rabat sur
         // raw plutot que d'echouer. Moins frais, mais toujours exploitable.
-        const resp = await fetch(SOURCE_RAW + (bust ? "?t=" + Date.now() : ""),
-                                 { cache: bust ? "reload" : "default" });
+        const resp = await fetch(SOURCE_RAW, { cache: "reload" });
         if (!resp.ok) throw new Error("HTTP " + resp.status);
         return resp.json();
     }
@@ -176,18 +193,15 @@ async function alive(base) {
 async function refresh(manual) {
     btn.disabled = true;
     setState("wait", manual ? "Checking..." : "Checking the current address...");
+    let ok = false;
 
     try {
-        let data = await readSource(manual);
-        let url = (data && data.url) || null;
-
-        if (url && !(await alive(url))) {
-            // L'adresse connue ne repond plus : peut-etre le fichier lu
-            // venait-il du cache. On force une relecture avant d'abandonner.
-            setState("wait", "Address looks stale, re-reading...");
-            data = await readSource(true);
-            url = (data && data.url) || null;
-        }
+        // Une seule lecture, la ou il y en avait deux : la relecture "forcee"
+        // n'avait de sens que du temps ou la premiere pouvait venir d'un cache
+        // de cinq minutes. La lecture etant desormais fraiche par construction,
+        // relire ne ferait que doubler le delai et la consommation de quota.
+        const data = await readSource();
+        const url = (data && data.url) || null;
 
         if (!url) {
             setState("bad", "No address published yet.");
@@ -203,10 +217,13 @@ async function refresh(manual) {
         if (await alive(url)) {
             setState("ok", "Online");
             go.classList.remove("off");
+            ok = true;
         } else {
             // Cas courant apres un redemarrage : la VM n'a pas encore publie sa
-            // nouvelle adresse. On le dit plutot que d'envoyer sur un lien mort.
-            setState("bad", "The site is not answering. It may have just restarted — try again in a few minutes.");
+            // nouvelle adresse. On le dit plutot que d'envoyer sur un lien mort,
+            // et on annonce le reessai automatique -- sans quoi le visiteur
+            // rafraichirait a la main une page qui le fait deja pour lui.
+            setState("bad", "The site is not answering — it may have just restarted. Retrying automatically.");
             go.classList.add("off");
         }
 
@@ -218,11 +235,25 @@ async function refresh(manual) {
         go.classList.add("off");
     } finally {
         btn.disabled = false;
+        schedule(ok);
     }
 }
 
+// Un setTimeout replanifie a chaque passage, et non un setInterval : le delai
+// depend du resultat du controle precedent, ce qu'un intervalle fixe ne sait
+// pas exprimer. clearTimeout evite qu'un clic sur "Check now" laisse deux
+// chaines de reessai courir en parallele.
+let timer = null;
+let backoff = MIN_MS;
+
+function schedule(ok) {
+    clearTimeout(timer);
+    const delay = ok ? OK_MS : backoff;
+    backoff = ok ? MIN_MS : Math.min(backoff * 2, MAX_MS);
+    timer = setTimeout(() => refresh(false), delay);
+}
+
 btn.addEventListener("click", () => refresh(true));
-setInterval(() => refresh(false), EVERY_MS);
 refresh(false);
 </script>
 </body>
