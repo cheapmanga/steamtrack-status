@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>steamtrack — gateway</title>
+<!-- Favicon en data URI, pas en fichier : cette page doit rester autonome,
+     elle est servie ailleurs que le site et doit marcher quand il est mort. -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2321262c'/%3E%3Cpath d='M6 23 L12 23 L12 17 L18 17 L18 11 L26 11' fill='none' stroke='%2367c1f5' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='26' cy='11' r='3.4' fill='%2367c1f5'/%3E%3C/svg%3E">
+<style>
+/* Passerelle : adresse d'entree stable vers un tunnel dont l'URL change.
+   Volontairement autonome (un seul fichier, aucune dependance) : elle doit
+   fonctionner meme quand tout le reste est injoignable. */
+:root {
+    --bg: #16191d; --panel: #21262c; --border: #32373d;
+    --text: #dfe3e6; --muted: #8f98a0; --dim: #6b7379;
+    --link: #67c1f5; --ok: #6ec06e; --bad: #d05a5a; --warn: #e0a458;
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font: 15px/1.6 Inter, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+}
+.card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 30px; max-width: 560px; width: 100%;
+}
+h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; }
+h1 span { color: var(--link); }
+.sub { color: var(--muted); font-size: 13.5px; margin: 0 0 22px; }
+/* Description du service, avant l'etat : un visiteur qui arrive par un lien
+   partage ne sait pas encore ce qu'est le site dont on lui annonce l'etat. */
+.what {
+    font-size: 13.5px; color: var(--muted); line-height: 1.65;
+    background: #1a1e23; border: 1px solid var(--border); border-radius: 5px;
+    padding: 13px 15px; margin: 0 0 20px;
+}
+.what strong { color: var(--text); font-weight: 600; }
+.state {
+    display: flex; align-items: center; gap: 9px;
+    font-size: 13.5px; margin-bottom: 16px;
+}
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); flex-shrink: 0; }
+.dot.ok { background: var(--ok); box-shadow: 0 0 8px rgba(110,192,110,.5); }
+.dot.bad { background: var(--bad); }
+.dot.wait { background: var(--warn); animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.go {
+    display: block; text-align: center; background: #2c3a47;
+    border: 1px solid var(--link); color: #fff; border-radius: 4px;
+    padding: 13px; font-size: 15px; font-weight: 600; text-decoration: none;
+    margin-bottom: 12px;
+}
+.go:hover { background: #35485a; }
+.go.off { opacity: .4; pointer-events: none; border-color: var(--border); }
+.addr {
+    font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+    color: var(--dim); word-break: break-all; margin-bottom: 18px;
+}
+.row { display: flex; gap: 10px; align-items: center; }
+button {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 4px; padding: 7px 13px; font: inherit; font-size: 13px;
+    cursor: pointer;
+}
+button:hover { color: #fff; border-color: var(--link); }
+button:disabled { opacity: .45; cursor: default; }
+.note {
+    margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border);
+    color: var(--dim); font-size: 12.5px;
+}
+.note code { background: #1a1e23; padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="card">
+    <h1>steam<span>track</span></h1>
+    <p class="sub">Stable entry point. The site runs behind a tunnel whose address changes; this page always points at the current one.</p>
+
+    <p class="what">
+        <strong>steamtrack</strong> follows a hand-picked list of Steam games and records what
+        changes about them &mdash; new builds, branches and depots, store page edits, price moves,
+        patch notes, player counts. It reads Steam&rsquo;s own public PICS feed as an anonymous
+        client, the same source SteamDB uses, and exposes everything through a browsable site and
+        a public API.
+    </p>
+
+    <div class="state"><span class="dot wait" id="dot"></span><span id="msg">Checking...</span></div>
+
+    <a class="go off" id="go" href="#">Open steamtrack</a>
+    <div class="addr" id="addr">—</div>
+
+    <div class="row">
+        <button id="check">Check now</button>
+        <span class="addr" style="margin:0" id="last"></span>
+    </div>
+
+    <div class="note">
+        The tunnel address is published by the server to
+        <code id="src">GitHub</code> whenever it changes. This page re-reads it
+        automatically, and verifies the site actually answers before sending you there.
+    </div>
+</div>
+
+<script>
+// Source de verite : un fichier publie par la VM a chaque changement d'adresse.
+// Deux facons de le lire, et l'ordre compte.
+//
+// L'API contents est la source PRINCIPALE. raw.githubusercontent impose un
+// cache CDN de 5 minutes que RIEN ne perce -- ni un parametre d'horodatage,
+// ni Cache-Control: no-cache, verifie le 19/07/2026 : le cache est cote
+// serveur et indexe sur le chemin, la relecture "forcee" plus bas relisait
+// donc exactement la meme valeur perimee. Consequence : apres un redemarrage
+// de la VM, cette page annoncait le service hors ligne pendant cinq minutes
+// alors qu'il tournait -- precisement le moment ou on vient la consulter.
+// L'API, elle, annonce max-age=60 et autorise le CORS.
+//
+// raw reste en REPLI : l'API plafonne a 60 requetes par heure et par IP sans
+// authentification. Cette page en consomme 6 (un passage toutes les dix
+// minutes), mais un visiteur qui martele "Check now" peut epuiser le quota --
+// et une adresse un peu vieille vaut mieux que pas d'adresse du tout.
+const SOURCE_API = "https://api.github.com/repos/cheapmanga/SteamTrack/contents/tunnel.json?ref=main";
+const SOURCE_RAW = "https://raw.githubusercontent.com/cheapmanga/SteamTrack/main/tunnel.json";
+const EVERY_MS = 600000;          // 10 minutes
+
+const dot = document.getElementById("dot");
+const msg = document.getElementById("msg");
+const go = document.getElementById("go");
+const addr = document.getElementById("addr");
+const last = document.getElementById("last");
+const btn = document.getElementById("check");
+
+let current = null;
+
+function setState(kind, text) {
+    dot.className = "dot " + kind;
+    msg.textContent = text;
+}
+
+// bust : contourner les caches autant que possible. Cote API cela fonctionne
+// vraiment ; cote raw c'est sans effet, d'ou l'ordre des sources ci-dessus.
+async function readSource(bust) {
+    try {
+        const resp = await fetch(SOURCE_API + (bust ? "&t=" + Date.now() : ""),
+                                 { cache: "no-store",
+                                   headers: { Accept: "application/vnd.github+json" } });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const meta = await resp.json();
+        // L'API ne rend pas le fichier tel quel : elle l'encapsule et encode
+        // son contenu en base64, decoupe en lignes qu'il faut recoller.
+        return JSON.parse(atob((meta.content || "").replace(/\s/g, "")));
+    } catch (err) {
+        // Quota epuise, panne de l'API, reponse illisible : on se rabat sur
+        // raw plutot que d'echouer. Moins frais, mais toujours exploitable.
+        const resp = await fetch(SOURCE_RAW + (bust ? "?t=" + Date.now() : ""),
+                                 { cache: bust ? "reload" : "default" });
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        return resp.json();
+    }
+}
+
+// On ne se contente pas de lire l'adresse : on verifie qu'elle repond. Une
+// adresse publiee mais morte (VM redemarree il y a deux minutes) serait pire
+// qu'un message d'attente honnete.
+async function alive(base) {
+    try {
+        const resp = await fetch(base.replace(/\/$/, "") + "/health",
+                                { cache: "no-store", signal: AbortSignal.timeout(8000) });
+        return resp.ok;
+    } catch {
+        return false;
+    }
+}
+
+async function refresh(manual) {
+    btn.disabled = true;
+    setState("wait", manual ? "Checking..." : "Checking the current address...");
+
+    try {
+        let data = await readSource(manual);
+        let url = (data && data.url) || null;
+
+        if (url && !(await alive(url))) {
+            // L'adresse connue ne repond plus : peut-etre le fichier lu
+            // venait-il du cache. On force une relecture avant d'abandonner.
+            setState("wait", "Address looks stale, re-reading...");
+            data = await readSource(true);
+            url = (data && data.url) || null;
+        }
+
+        if (!url) {
+            setState("bad", "No address published yet.");
+            go.classList.add("off");
+            addr.textContent = "—";
+            return;
+        }
+
+        current = url;
+        addr.textContent = url;
+        go.href = url;
+
+        if (await alive(url)) {
+            setState("ok", "Online");
+            go.classList.remove("off");
+        } else {
+            // Cas courant apres un redemarrage : la VM n'a pas encore publie sa
+            // nouvelle adresse. On le dit plutot que d'envoyer sur un lien mort.
+            setState("bad", "The site is not answering. It may have just restarted — try again in a few minutes.");
+            go.classList.add("off");
+        }
+
+        if (data.updated) {
+            last.textContent = "published " + new Date(data.updated).toLocaleString();
+        }
+    } catch (err) {
+        setState("bad", "Could not read the published address: " + err.message);
+        go.classList.add("off");
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+btn.addEventListener("click", () => refresh(true));
+setInterval(() => refresh(false), EVERY_MS);
+refresh(false);
+</script>
+</body>
+</html>
